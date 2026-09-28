@@ -10,12 +10,32 @@ import (
 	"fmt"
 )
 
+// ListAppHookDeliveriesOptions specifies the optional parameters to the
+// AppsService.ListHookDeliveriesWithOptions method.
+type ListAppHookDeliveriesOptions struct {
+	ListCursorOptions
+	Status string `url:"status,omitempty"`
+}
+
 // ListHookDeliveries lists deliveries of an App webhook.
 //
 // GitHub API docs: https://docs.github.com/rest/apps/webhooks#list-deliveries-for-an-app-webhook
 //
 //meta:operation GET /app/hook/deliveries
 func (s *AppsService) ListHookDeliveries(ctx context.Context, opts *ListCursorOptions) ([]*HookDelivery, *Response, error) {
+	appOpts := &ListAppHookDeliveriesOptions{}
+	if opts != nil {
+		appOpts.ListCursorOptions = *opts
+	}
+
+	return s.ListHookDeliveriesWithOptions(ctx, appOpts)
+}
+
+// ListHookDeliveriesWithOptions lists deliveries of an App webhook with
+// endpoint-specific options.
+//
+// GitHub API docs: https://docs.github.com/rest/apps/webhooks#list-deliveries-for-an-app-webhook
+func (s *AppsService) ListHookDeliveriesWithOptions(ctx context.Context, opts *ListAppHookDeliveriesOptions) ([]*HookDelivery, *Response, error) {
 	u, err := addOptions("app/hook/deliveries", opts)
 	if err != nil {
 		return nil, nil, err
