@@ -48,6 +48,49 @@ func TestAppsService_ListHookDeliveries(t *testing.T) {
 	})
 }
 
+func TestAppsService_ListHookDeliveriesWithOptions(t *testing.T) {
+	client, mux, _, teardown := setup()
+	defer teardown()
+
+	mux.HandleFunc("/app/hook/deliveries", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "GET")
+		testFormValues(t, r, values{
+			"cursor":   "v1_12077215967",
+			"per_page": "100",
+			"status":   "failure",
+		})
+		fmt.Fprint(w, `[{"id":1}, {"id":2}]`)
+	})
+
+	opts := &ListAppHookDeliveriesOptions{
+		ListCursorOptions: ListCursorOptions{
+			Cursor:  "v1_12077215967",
+			PerPage: 100,
+		},
+		Status: "failure",
+	}
+
+	ctx := context.Background()
+	deliveries, _, err := client.Apps.ListHookDeliveriesWithOptions(ctx, opts)
+	if err != nil {
+		t.Errorf("Apps.ListHookDeliveriesWithOptions returned error: %v", err)
+	}
+
+	want := []*HookDelivery{{ID: Int64(1)}, {ID: Int64(2)}}
+	if d := cmp.Diff(deliveries, want); d != "" {
+		t.Errorf("Apps.ListHookDeliveriesWithOptions want (-), got (+):\n%s", d)
+	}
+
+	const methodName = "ListHookDeliveriesWithOptions"
+	testNewRequestAndDoFailure(t, methodName, client, func() (*Response, error) {
+		got, resp, err := client.Apps.ListHookDeliveriesWithOptions(ctx, opts)
+		if got != nil {
+			t.Errorf("testNewRequestAndDoFailure %v = %#v, want nil", methodName, got)
+		}
+		return resp, err
+	})
+}
+
 func TestAppsService_GetHookDelivery(t *testing.T) {
 	client, mux, _, teardown := setup()
 	defer teardown()
