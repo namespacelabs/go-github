@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -172,6 +173,9 @@ type Client struct {
 	rateMu                  sync.Mutex
 	rateLimits              [Categories]Rate // Rate limits for the client as determined by the most recent API calls.
 	secondaryRateLimitReset time.Time        // Secondary rate limit reset for the client as determined by the most recent API calls.
+	// secondaryRateLimitBackoffs counts consecutive secondary rate limits without Retry-After,
+	// which escalate the fallback cooldown.
+	secondaryRateLimitBackoffs int
 
 	common service // Reuse a single struct instead of allocating one for each service on the heap.
 
@@ -450,11 +454,10 @@ func (c *Client) copy() *Client {
 	c.clientMu.Lock()
 	// can't use *c here because that would copy mutexes by value.
 	clone := Client{
-		client:                  &http.Client{},
-		UserAgent:               c.UserAgent,
-		BaseURL:                 c.BaseURL,
-		UploadURL:               c.UploadURL,
-		secondaryRateLimitReset: c.secondaryRateLimitReset,
+		client:    &http.Client{},
+		UserAgent: c.UserAgent,
+		BaseURL:   c.BaseURL,
+		UploadURL: c.UploadURL,
 	}
 	c.clientMu.Unlock()
 	if c.client != nil {
@@ -465,6 +468,8 @@ func (c *Client) copy() *Client {
 	}
 	c.rateMu.Lock()
 	copy(clone.rateLimits[:], c.rateLimits[:])
+	clone.secondaryRateLimitReset = c.secondaryRateLimitReset
+	clone.secondaryRateLimitBackoffs = c.secondaryRateLimitBackoffs
 	c.rateMu.Unlock()
 	return &clone
 }
@@ -766,23 +771,37 @@ func parseSecondaryRate(r *http.Response) *time.Duration {
 	// According to GitHub support, the "Retry-After" header value will be
 	// an integer which represents the number of seconds that one should
 	// wait before resuming making requests.
-	if v := r.Header.Get(headerRetryAfter); v != "" {
-		retryAfterSeconds, _ := strconv.ParseInt(v, 10, 64) // Error handling is noop.
-		retryAfter := time.Duration(retryAfterSeconds) * time.Second
+	// HTTP also allows an HTTP-date. A malformed value is treated as absent rather than as zero.
+	v := r.Header.Get(headerRetryAfter)
+	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if seconds < 0 || seconds > int64(math.MaxInt64/time.Second) {
+			return nil
+		}
+		retryAfter := time.Duration(seconds) * time.Second
+		return &retryAfter
+	}
+	if retryAt, err := http.ParseTime(v); err == nil {
+		now := time.Now()
+		if retryAt.After(now.Add(math.MaxInt64)) {
+			return nil
+		}
+		retryAfter := max(0, retryAt.Sub(now))
 		return &retryAfter
 	}
 
-	// According to GitHub support, endpoints might return x-ratelimit-reset instead,
-	// as an integer which represents the number of seconds since epoch UTC,
-	// represting the time to resume making requests.
-	if v := r.Header.Get(headerRateReset); v != "" {
-		secondsSinceEpoch, _ := strconv.ParseInt(v, 10, 64) // Error handling is noop.
-		retryAfter := time.Until(time.Unix(secondsSinceEpoch, 0))
-		return &retryAfter
-	}
-
+	// x-ratelimit-reset only applies when x-ratelimit-remaining is 0, and CheckResponse reports
+	// those responses as a *RateLimitError that blocks until the reset. Otherwise the header is
+	// the unrelated primary quota reset, so BareDo falls back to an escalating cooldown instead.
 	return nil
 }
+
+const (
+	// secondaryRateLimitBackoff is the first fallback cooldown for a secondary rate limit without
+	// Retry-After; GitHub asks to wait at least one minute and to back off exponentially.
+	secondaryRateLimitBackoff = time.Minute
+	// maxSecondaryRateLimitBackoffs caps the fallback cooldown at secondaryRateLimitBackoff << 4.
+	maxSecondaryRateLimitBackoffs = 4
+)
 
 // parseTokenExpiration parses the TokenExpiration related headers.
 // Returns 0001-01-01 if the header is not defined or could not be parsed.
@@ -872,7 +891,14 @@ func (c *Client) BareDo(ctx context.Context, req *http.Request) (*Response, erro
 	}
 
 	err = CheckResponse(resp)
-	if err != nil {
+	if err == nil {
+		c.rateMu.Lock()
+		// A request that was in flight when the secondary rate limit was hit must not reset its escalation.
+		if !time.Now().Before(c.secondaryRateLimitReset) {
+			c.secondaryRateLimitBackoffs = 0
+		}
+		c.rateMu.Unlock()
+	} else {
 		defer resp.Body.Close()
 		// Special case for AcceptedErrors. If an AcceptedError
 		// has been encountered, the response's payload will be
@@ -900,10 +926,20 @@ func (c *Client) BareDo(ctx context.Context, req *http.Request) (*Response, erro
 		}
 
 		// Update the secondary rate limit if we hit it.
-		rerr, ok := err.(*AbuseRateLimitError)
-		if ok && rerr.RetryAfter != nil {
+		if rerr, ok := err.(*AbuseRateLimitError); ok {
+			now := time.Now()
 			c.rateMu.Lock()
-			c.secondaryRateLimitReset = time.Now().Add(*rerr.RetryAfter)
+			if rerr.RetryAfter != nil {
+				c.secondaryRateLimitReset = now.Add(*rerr.RetryAfter)
+			} else {
+				// Concurrently failing requests keep the running cooldown instead of escalating it again.
+				if !now.Before(c.secondaryRateLimitReset) {
+					c.secondaryRateLimitReset = now.Add(secondaryRateLimitBackoff << c.secondaryRateLimitBackoffs)
+					c.secondaryRateLimitBackoffs = min(c.secondaryRateLimitBackoffs+1, maxSecondaryRateLimitBackoffs)
+				}
+				retryAfter := c.secondaryRateLimitReset.Sub(now)
+				rerr.RetryAfter = &retryAfter
+			}
 			c.rateMu.Unlock()
 		}
 	}
@@ -1194,15 +1230,15 @@ func (ae *AcceptedError) Is(target error) bool {
 	return bytes.Equal(ae.Raw, v.Raw)
 }
 
-// AbuseRateLimitError occurs when GitHub returns 403 Forbidden response with the
-// "documentation_url" field value equal to "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits".
+// AbuseRateLimitError occurs when GitHub returns a 403 Forbidden or 429 Too Many Requests
+// response that points to or mentions the secondary rate limits.
 type AbuseRateLimitError struct {
 	Response *http.Response // HTTP response that caused this error
 	Message  string         `json:"message"` // error message
 
-	// RetryAfter is provided with some abuse rate limit errors. If present,
-	// it is the amount of time that the client should wait before retrying.
-	// Otherwise, the client should try again later (after an unspecified amount of time).
+	// RetryAfter is the amount of time that the client should wait before retrying.
+	// Client.Do takes it from the Retry-After header or, without one, uses an escalating
+	// cooldown starting at one minute. CheckResponse only sets it from Retry-After.
 	RetryAfter *time.Duration
 }
 
@@ -1313,15 +1349,15 @@ func CheckResponse(r *http.Response) error {
 	switch {
 	case r.StatusCode == http.StatusUnauthorized && strings.HasPrefix(r.Header.Get(headerOTP), "required"):
 		return (*TwoFactorAuthError)(errorResponse)
-	case r.StatusCode == http.StatusForbidden && r.Header.Get(headerRateRemaining) == "0":
+	case (r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusTooManyRequests) &&
+		r.Header.Get(headerRateRemaining) == "0":
 		return &RateLimitError{
 			Rate:     parseRate(r),
 			Response: errorResponse.Response,
 			Message:  errorResponse.Message,
 		}
-	case r.StatusCode == http.StatusForbidden &&
-		(strings.HasSuffix(errorResponse.DocumentationURL, "#abuse-rate-limits") ||
-			strings.HasSuffix(errorResponse.DocumentationURL, "secondary-rate-limits")):
+	case (r.StatusCode == http.StatusForbidden || r.StatusCode == http.StatusTooManyRequests) &&
+		isSecondaryRateLimitResponse(errorResponse):
 		abuseRateLimitError := &AbuseRateLimitError{
 			Response: errorResponse.Response,
 			Message:  errorResponse.Message,
@@ -1333,6 +1369,14 @@ func CheckResponse(r *http.Response) error {
 	default:
 		return errorResponse
 	}
+}
+
+func isSecondaryRateLimitResponse(errorResponse *ErrorResponse) bool {
+	message := strings.ToLower(errorResponse.Message)
+	return strings.HasSuffix(errorResponse.DocumentationURL, "#abuse-rate-limits") ||
+		strings.HasSuffix(errorResponse.DocumentationURL, "secondary-rate-limits") ||
+		strings.Contains(message, "secondary rate limit") ||
+		strings.Contains(message, "abuse detection mechanism")
 }
 
 // parseBoolResponse determines the boolean result from a GitHub API response.
