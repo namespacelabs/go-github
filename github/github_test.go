@@ -1769,6 +1769,76 @@ func TestDo_rateLimit_abuseRateLimitError_backoff(t *testing.T) {
 	expectRetryAfter(do(), time.Minute)
 }
 
+// Ensure responses of requests that were in flight when a secondary rate limit was hit neither
+// escalate nor reset the running fallback cooldown.
+func TestDo_rateLimit_abuseRateLimitError_inFlightResponses(t *testing.T) {
+	for _, inFlightStatus := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(inFlightStatus), func(t *testing.T) {
+			client, mux, _, teardown := setup()
+			defer teardown()
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			mux.HandleFunc("/in-flight", func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				<-release
+				if inFlightStatus == http.StatusOK {
+					return
+				}
+				w.WriteHeader(inFlightStatus)
+				fmt.Fprintln(w, `{"message": "You have exceeded a secondary rate limit."}`)
+			})
+			mux.HandleFunc("/limited", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				fmt.Fprintln(w, `{"message": "You have exceeded a secondary rate limit."}`)
+			})
+
+			ctx := context.Background()
+			do := func(path string) error {
+				req, _ := client.NewRequest("GET", path, nil)
+				_, err := client.Do(ctx, req, nil)
+				return err
+			}
+			retryAfter := func(err error) time.Duration {
+				t.Helper()
+				abuseRateLimitErr, ok := err.(*AbuseRateLimitError)
+				if !ok || abuseRateLimitErr.RetryAfter == nil {
+					t.Fatalf("Expected a *AbuseRateLimitError with RetryAfter; got %#v.", err)
+				}
+				return *abuseRateLimitErr.RetryAfter
+			}
+
+			inFlight := make(chan error, 1)
+			go func() { inFlight <- do("in-flight") }()
+			<-entered
+
+			if got := retryAfter(do("limited")); got != time.Minute {
+				t.Fatalf("first cooldown = %v, want %v", got, time.Minute)
+			}
+
+			close(release)
+			err := <-inFlight
+			if inFlightStatus == http.StatusOK {
+				if err != nil {
+					t.Fatalf("in-flight request returned unexpected error: %v", err)
+				}
+			} else if got := retryAfter(err); got > time.Minute || time.Minute-got > time.Second {
+				// The running cooldown is kept rather than escalated.
+				t.Errorf("in-flight cooldown = %v, want the remaining %v", got, time.Minute)
+			}
+
+			// Expire the running cooldown, as if its time had passed.
+			client.rateMu.Lock()
+			client.secondaryRateLimitReset = time.Time{}
+			client.rateMu.Unlock()
+
+			if got := retryAfter(do("limited")); got != 2*time.Minute {
+				t.Errorf("next cooldown = %v, want %v", got, 2*time.Minute)
+			}
+		})
+	}
+}
+
 func TestDo_noContent(t *testing.T) {
 	client, mux, _, teardown := setup()
 	defer teardown()
