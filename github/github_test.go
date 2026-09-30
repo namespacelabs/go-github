@@ -1579,7 +1579,8 @@ func TestDo_rateLimit_abuseRateLimitError(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected a *AbuseRateLimitError error; got %#v.", err)
 	}
-	if got, want := abuseRateLimitErr.RetryAfter, (*time.Duration)(nil); got != want {
+	// Without Retry-After, the client falls back to a one minute cooldown.
+	if got, want := abuseRateLimitErr.RetryAfter, time.Minute; got == nil || *got != want {
 		t.Errorf("abuseRateLimitErr RetryAfter = %v, want %v", got, want)
 	}
 }
@@ -1614,7 +1615,8 @@ func TestDo_rateLimit_abuseRateLimitErrorEnterprise(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected a *AbuseRateLimitError error; got %#v.", err)
 	}
-	if got, want := abuseRateLimitErr.RetryAfter, (*time.Duration)(nil); got != want {
+	// Without Retry-After, the client falls back to a one minute cooldown.
+	if got, want := abuseRateLimitErr.RetryAfter, time.Minute; got == nil || *got != want {
 		t.Errorf("abuseRateLimitErr RetryAfter = %v, want %v", got, want)
 	}
 }
@@ -1672,13 +1674,13 @@ func TestDo_rateLimit_abuseRateLimitError_retryAfter(t *testing.T) {
 	}
 }
 
-// Ensure *AbuseRateLimitError.RetryAfter is parsed correctly for the x-ratelimit-reset header.
+// Ensure x-ratelimit-reset, which describes the primary quota, does not become the secondary cooldown.
 func TestDo_rateLimit_abuseRateLimitError_xRateLimitReset(t *testing.T) {
 	client, mux, _, teardown := setup()
 	defer teardown()
 
-	// x-ratelimit-reset value of 123 seconds into the future.
-	blockUntil := time.Now().Add(time.Duration(123) * time.Second).Unix()
+	// x-ratelimit-reset value of an hour into the future.
+	blockUntil := time.Now().Add(time.Hour).Unix()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1692,12 +1694,8 @@ func TestDo_rateLimit_abuseRateLimitError_xRateLimitReset(t *testing.T) {
 	})
 
 	req, _ := client.NewRequest("GET", ".", nil)
-	ctx := context.Background()
-	_, err := client.Do(ctx, req, nil)
+	_, err := client.Do(context.Background(), req, nil)
 
-	if err == nil {
-		t.Error("Expected error to be returned.")
-	}
 	abuseRateLimitErr, ok := err.(*AbuseRateLimitError)
 	if !ok {
 		t.Fatalf("Expected a *AbuseRateLimitError error; got %#v.", err)
@@ -1705,29 +1703,70 @@ func TestDo_rateLimit_abuseRateLimitError_xRateLimitReset(t *testing.T) {
 	if abuseRateLimitErr.RetryAfter == nil {
 		t.Fatalf("abuseRateLimitErr RetryAfter is nil, expected not-nil")
 	}
-	// the retry after value might be a bit smaller than the original duration because the duration is calculated from the expected end-of-cooldown time
-	if got, want := *abuseRateLimitErr.RetryAfter, 123*time.Second; want-got > 1*time.Second {
+	if got, want := *abuseRateLimitErr.RetryAfter, time.Minute; got != want {
 		t.Errorf("abuseRateLimitErr RetryAfter = %v, want %v", got, want)
+	}
+}
+
+// Ensure secondary rate limits without Retry-After escalate the fallback cooldown until a request succeeds.
+func TestDo_rateLimit_abuseRateLimitError_backoff(t *testing.T) {
+	client, mux, _, teardown := setup()
+	defer teardown()
+
+	limited := true
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !limited {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprintln(w, `{"message": "You have exceeded a secondary rate limit."}`)
+	})
+
+	ctx := context.Background()
+	do := func() error {
+		t.Helper()
+		// Expire the running cooldown, as if its time had passed.
+		client.rateMu.Lock()
+		client.secondaryRateLimitReset = time.Time{}
+		client.rateMu.Unlock()
+		req, _ := client.NewRequest("GET", ".", nil)
+		_, err := client.Do(ctx, req, nil)
+		return err
+	}
+	expectRetryAfter := func(err error, want time.Duration) {
+		t.Helper()
+		abuseRateLimitErr, ok := err.(*AbuseRateLimitError)
+		if !ok {
+			t.Fatalf("Expected a *AbuseRateLimitError error; got %#v.", err)
+		}
+		if abuseRateLimitErr.RetryAfter == nil {
+			t.Fatalf("abuseRateLimitErr RetryAfter is nil, expected %v", want)
+		}
+		if got := *abuseRateLimitErr.RetryAfter; got > want || want-got > time.Second {
+			t.Errorf("abuseRateLimitErr RetryAfter = %v, want %v", got, want)
+		}
 	}
 
-	// expect prevention of a following request
-	if _, err = client.Do(ctx, req, nil); err == nil {
-		t.Error("Expected error to be returned.")
+	for _, want := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute, 16 * time.Minute} {
+		expectRetryAfter(do(), want)
 	}
-	abuseRateLimitErr, ok = err.(*AbuseRateLimitError)
-	if !ok {
-		t.Fatalf("Expected a *AbuseRateLimitError error; got %#v.", err)
-	}
-	if abuseRateLimitErr.RetryAfter == nil {
-		t.Fatalf("abuseRateLimitErr RetryAfter is nil, expected not-nil")
-	}
-	// the saved duration might be a bit smaller than Retry-After because the duration is calculated from the expected end-of-cooldown time
-	if got, want := *abuseRateLimitErr.RetryAfter, 123*time.Second; want-got > 1*time.Second {
-		t.Errorf("abuseRateLimitErr RetryAfter = %v, want %v", got, want)
-	}
-	if got, wantSuffix := abuseRateLimitErr.Message, "not making remote request."; !strings.HasSuffix(got, wantSuffix) {
+
+	// A request made while the cooldown is running fails fast without escalating it.
+	req, _ := client.NewRequest("GET", ".", nil)
+	_, err := client.Do(ctx, req, nil)
+	expectRetryAfter(err, 16*time.Minute)
+	if got, wantSuffix := err.Error(), "not making remote request."; !strings.Contains(got, wantSuffix) {
 		t.Errorf("Expected request to be prevented because of secondary rate limit, got: %v.", got)
 	}
+
+	limited = false
+	if err := do(); err != nil {
+		t.Fatalf("Do returned unexpected error: %v", err)
+	}
+
+	limited = true
+	expectRetryAfter(do(), time.Minute)
 }
 
 func TestDo_noContent(t *testing.T) {
@@ -1842,6 +1881,68 @@ func TestCheckResponse_AbuseRateLimit(t *testing.T) {
 	}
 	if !errors.Is(err, want) {
 		t.Errorf("Error = %#v, want %#v", err, want)
+	}
+}
+
+func TestCheckResponse_TooManyRequests(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining string
+		body      string
+		want      string
+	}{
+		{"primary", "0", `{"message":"API rate limit exceeded"}`, "*github.RateLimitError"},
+		// An exhausted primary quota takes precedence, even when the message reports a secondary limit.
+		{"primary with secondary message", "0", `{"message":"You have exceeded a secondary rate limit."}`, "*github.RateLimitError"},
+		{"secondary", "1", `{"message":"You have exceeded a secondary rate limit."}`, "*github.AbuseRateLimitError"},
+		{"unclassified", "1", `{"message":"m"}`, "*github.ErrorResponse"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := &http.Response{
+				Request:    &http.Request{},
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}
+			res.Header.Set(headerRateRemaining, tt.remaining)
+			if got := fmt.Sprintf("%T", CheckResponse(res)); got != tt.want {
+				t.Errorf("CheckResponse returned %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSecondaryRate(t *testing.T) {
+	d := func(v time.Duration) *time.Duration { return &v }
+	tests := []struct {
+		name       string
+		retryAfter string
+		want       *time.Duration
+	}{
+		{"absent", "", nil},
+		{"seconds", "30", d(30 * time.Second)},
+		{"zero", "0", d(0)},
+		{"HTTP-date in the past", "Mon, 02 Jan 2006 15:04:05 GMT", d(0)},
+		{"negative", "-5", nil},
+		{"overflow", "9223372036854775807", nil},
+		{"HTTP-date overflow", "Fri, 31 Dec 9999 23:59:59 GMT", nil},
+		{"malformed", "soon", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := &http.Response{Header: http.Header{}}
+			res.Header.Set(headerRetryAfter, tt.retryAfter)
+			if got := parseSecondaryRate(res); !cmp.Equal(got, tt.want) {
+				t.Errorf("parseSecondaryRate = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	res := &http.Response{Header: http.Header{}}
+	res.Header.Set(headerRetryAfter, time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
+	if got := parseSecondaryRate(res); got == nil || *got <= 85*time.Second || *got > 90*time.Second {
+		t.Errorf("parseSecondaryRate = %v, want about 90s", got)
 	}
 }
 
